@@ -242,6 +242,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable logging of diffusion pipeline stats.",
     )
+    parser.add_argument(
+        "--timing-output",
+        type=str,
+        default=None,
+        help="Path to write structured timing JSON (for bench.py integration).",
+    )
+    parser.add_argument(
+        "--nsys-cuda-profiler-range",
+        action="store_true",
+        help=(
+            "Call cudaProfilerStart/Stop around omni.generate(). Use with "
+            "`nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop` "
+            "to capture only the generation timeline."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -393,25 +408,44 @@ def main():
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale
 
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-            extra_args=extra_args,
-        ),
-    )
+    nsys_range_started = False
+    nsys_nvtx_pushed = False
+    if args.nsys_cuda_profiler_range:
+        print("[nsys] cudaProfilerStart before omni.generate()", flush=True)
+        torch.cuda.cudart().cudaProfilerStart()
+        nsys_range_started = True
+        torch.cuda.nvtx.range_push("hy_image_generate")
+        nsys_nvtx_pushed = True
 
-    generation_end = time.perf_counter()
+    generation_end = None
+    try:
+        outputs = omni.generate(
+            {
+                "prompt": args.prompt,
+                "negative_prompt": args.negative_prompt,
+            },
+            OmniDiffusionSamplingParams(
+                height=args.height,
+                width=args.width,
+                generator=generator,
+                true_cfg_scale=args.cfg_scale,
+                guidance_scale=args.guidance_scale,
+                guidance_scale_2=args.guidance_scale_2,
+                num_inference_steps=args.num_inference_steps,
+                num_outputs_per_prompt=args.num_images_per_prompt,
+                extra_args=extra_args,
+            ),
+        )
+        generation_end = time.perf_counter()
+    finally:
+        if nsys_nvtx_pushed:
+            torch.cuda.nvtx.range_pop()
+        if nsys_range_started:
+            torch.cuda.cudart().cudaProfilerStop()
+            print("[nsys] cudaProfilerStop after omni.generate()", flush=True)
+
+    if generation_end is None:
+        generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
     # Print profiling results
@@ -463,6 +497,31 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+
+    # Write structured timing data for bench.py integration
+    if args.timing_output:
+        import hashlib
+        import io
+        import json as _json
+
+        timing_data = {
+            "generation_time_s": generation_time,
+            "stage_durations": {},
+            "peak_memory_mb": 0.0,
+            "image_sha256": [],
+        }
+        if hasattr(first_output, "stage_durations") and first_output.stage_durations:
+            timing_data["stage_durations"] = dict(first_output.stage_durations)
+        if hasattr(first_output, "peak_memory_mb") and first_output.peak_memory_mb:
+            timing_data["peak_memory_mb"] = float(first_output.peak_memory_mb)
+        for img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            timing_data["image_sha256"].append(hashlib.sha256(buf.getvalue()).hexdigest())
+        timing_path = Path(args.timing_output)
+        timing_path.parent.mkdir(parents=True, exist_ok=True)
+        timing_path.write_text(_json.dumps(timing_data, indent=2))
+        print(f"Timing data written to {timing_path}")
 
 
 if __name__ == "__main__":
